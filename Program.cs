@@ -1,11 +1,17 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Collections.Immutable;
 using GBX.NET;
 using GBX.NET.Engines.Game;
+using GBX.NET.Engines.Script;
 using GBX.NET.Exceptions;
 
 internal static class Program
 {
+    private const string DefaultSignatureMetadataKey = "EmbedRaceValidationGhost";
+    private const string ToolName = "EmbedRaceValidationGhost";
+    private const string SignatureText = "Validation ghost embedded by ar's EmbedRaceValidationGhost tool";
+
     public static int Main(string[] args)
     {
         try
@@ -30,9 +36,9 @@ internal static class Program
                 return 2;
             }
 
-            if (!File.Exists(options.GhostPath))
+            if (!File.Exists(options.GhostOrReplayPath))
             {
-                Console.WriteLine($"Ghost file not found: {options.GhostPath}");
+                Console.WriteLine($"Ghost/replay file not found: {options.GhostOrReplayPath}");
                 return 2;
             }
 
@@ -46,20 +52,27 @@ internal static class Program
             EnsureParentDirectory(outputPath);
 
             Console.WriteLine($"Map:     {Path.GetFullPath(options.MapPath)}");
-            Console.WriteLine($"Ghost:   {Path.GetFullPath(options.GhostPath)}");
+            Console.WriteLine($"Input:   {Path.GetFullPath(options.GhostOrReplayPath)}");
+            Console.WriteLine($"Index:   {options.GhostIndex}");
             Console.WriteLine($"Output:  {Path.GetFullPath(outputPath)}");
             Console.WriteLine($"gbxlzo:  {gbxlzoPath}");
             Console.WriteLine();
 
             using var temp = TemporaryWorkspace.Create(options.TempRoot, options.KeepTemp);
             var mapUncompressedPath = temp.GetFilePath("map.uncompressed.gbx");
-            var ghostUncompressedPath = temp.GetFilePath("ghost.uncompressed.gbx");
+            var ghostOrReplayUncompressedPath = temp.GetFilePath("ghost_or_replay.uncompressed.gbx");
             var outputUncompressedPath = temp.GetFilePath("output.uncompressed.gbx");
 
             SafeDecompress(gbxlzoPath, options.MapPath, mapUncompressedPath, "map");
-            SafeDecompress(gbxlzoPath, options.GhostPath, ghostUncompressedPath, "ghost");
+            SafeDecompress(gbxlzoPath, options.GhostOrReplayPath, ghostOrReplayUncompressedPath, "ghost/replay");
 
-            EmbedValidationGhost(mapUncompressedPath, ghostUncompressedPath, outputUncompressedPath);
+            EmbedValidationGhost(
+                mapUncompressedPath,
+                ghostOrReplayUncompressedPath,
+                outputUncompressedPath,
+                options.GhostIndex,
+                options.MapPath,
+                options.GhostOrReplayPath);
 
             Console.WriteLine("Compressing output map...");
             RunGbxlzoOrThrow(gbxlzoPath, outputUncompressedPath, outputPath, compress: true);
@@ -89,12 +102,18 @@ internal static class Program
         File.Copy(inputPath, outputPath, overwrite: true);
     }
 
-    private static void EmbedValidationGhost(string mapPath, string ghostPath, string outPath)
+    private static void EmbedValidationGhost(
+        string mapPath,
+        string ghostOrReplayPath,
+        string outPath,
+        int ghostIndex,
+        string originalMapPath,
+        string originalGhostOrReplayPath)
     {
         Console.WriteLine("Embedding RaceValidateGhost...");
 
         Gbx<CGameCtnChallenge> mapGbx;
-        CGameCtnGhost ghostNode;
+        GhostSelectionResult ghostSelection;
 
         try
         {
@@ -111,24 +130,183 @@ internal static class Program
 
         try
         {
-            ghostNode = Gbx.ParseNode<CGameCtnGhost>(ghostPath);
+            ghostSelection = ParseGhostFromGhostOrReplay(ghostOrReplayPath, ghostIndex);
         }
         catch (LzoNotDefinedException)
         {
-            throw new InvalidOperationException("Ghost still appears compressed after decompression step.");
+            throw new InvalidOperationException("Ghost/replay input still appears compressed after decompression step.");
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Unable to parse ghost: {ghostPath}. {ex.Message}");
+            throw new InvalidOperationException($"Unable to parse ghost/replay input: {ghostOrReplayPath}. {ex.Message}");
         }
 
         var mapNode = mapGbx.Node;
+        var hadExistingValidationGhost = mapNode.ChallengeParameters?.RaceValidateGhost is not null;
         mapNode.ChallengeParameters ??= new CGameCtnChallengeParameters();
-        mapNode.ChallengeParameters.RaceValidateGhost = ghostNode;
+        mapNode.ChallengeParameters.RaceValidateGhost = ghostSelection.Ghost;
+
+        AddEmbeddingMetadata(
+            mapNode,
+            ghostSelection,
+            originalMapPath,
+            originalGhostOrReplayPath,
+            hadExistingValidationGhost);
 
         var writeSettings = new GbxWriteSettings();
         ForceUncompressed(writeSettings);
         mapGbx.Save(outPath, writeSettings);
+    }
+
+    private static GhostSelectionResult ParseGhostFromGhostOrReplay(string path, int ghostIndex)
+    {
+        var node = Gbx.ParseNode(path);
+
+        return node switch
+        {
+            CGameCtnGhost ghost => ExtractGhostFromSingleGhost(ghost, ghostIndex),
+            CGameCtnReplayRecord replay => ExtractGhostFromReplay(replay, ghostIndex),
+            CGameCtnMediaClip clip => ExtractGhostFromClip(clip, ghostIndex),
+            null => throw new InvalidOperationException("Input file has no readable node."),
+            _ => throw new InvalidOperationException($"Input type {node.GetType().Name} is unsupported. Provide a .Ghost.Gbx or .Replay.Gbx file.")
+        };
+    }
+
+    private static GhostSelectionResult ExtractGhostFromSingleGhost(CGameCtnGhost ghost, int ghostIndex)
+    {
+        if (ghostIndex != 0)
+        {
+            Console.WriteLine($"Input has a single ghost. Ignoring --ghost-index {ghostIndex} and using that ghost.");
+        }
+
+        return new GhostSelectionResult(
+            Ghost: ghost,
+            SourceKind: "Ghost",
+            RequestedGhostIndex: ghostIndex,
+            UsedGhostIndex: 0,
+            AvailableGhostCount: 1);
+    }
+
+    private static GhostSelectionResult ExtractGhostFromReplay(CGameCtnReplayRecord replay, int ghostIndex)
+    {
+        ImmutableList<CGameCtnGhost> ghosts = replay.GetGhosts().ToImmutableList();
+        return ExtractGhostFromList(ghosts, ghostIndex, "Replay");
+    }
+
+    private static GhostSelectionResult ExtractGhostFromClip(CGameCtnMediaClip clip, int ghostIndex)
+    {
+        ImmutableList<CGameCtnGhost> ghosts = clip.GetGhosts().ToImmutableList();
+        return ExtractGhostFromList(ghosts, ghostIndex, "Clip");
+    }
+
+    private static GhostSelectionResult ExtractGhostFromList(ImmutableList<CGameCtnGhost> ghosts, int ghostIndex, string sourceKind)
+    {
+        if (ghosts.Count == 0)
+        {
+            throw new InvalidOperationException($"{sourceKind} file does not contain any ghosts.");
+        }
+
+        if (ghosts.Count == 1)
+        {
+            if (ghostIndex != 0)
+            {
+                Console.WriteLine($"{sourceKind} contains a single ghost. Ignoring --ghost-index {ghostIndex} and using index 0.");
+            }
+
+            return new GhostSelectionResult(
+                Ghost: ghosts[0],
+                SourceKind: sourceKind,
+                RequestedGhostIndex: ghostIndex,
+                UsedGhostIndex: 0,
+                AvailableGhostCount: 1);
+        }
+
+        if (ghostIndex >= ghosts.Count)
+        {
+            throw new InvalidOperationException($"{sourceKind} ghost index {ghostIndex} is out of range. Available range: 0..{ghosts.Count - 1}.");
+        }
+
+        if (ghosts.Count > 1)
+        {
+            Console.WriteLine($"{sourceKind} contains {ghosts.Count} ghosts. Using index {ghostIndex}.");
+        }
+
+        return new GhostSelectionResult(
+            Ghost: ghosts[ghostIndex],
+            SourceKind: sourceKind,
+            RequestedGhostIndex: ghostIndex,
+            UsedGhostIndex: ghostIndex,
+            AvailableGhostCount: ghosts.Count);
+    }
+
+    private static void AddEmbeddingMetadata(
+        CGameCtnChallenge map,
+        GhostSelectionResult selection,
+        string originalMapPath,
+        string originalGhostOrReplayPath,
+        bool replacedExistingValidationGhost)
+    {
+        var metadata = map.ScriptMetadata ??= new CScriptTraitsMetadata();
+        EnsureMetadataChunk(metadata);
+        metadata.Traits ??= new Dictionary<string, CScriptTraitsMetadata.ScriptTrait>();
+
+        var key = ResolveSignatureMetadataKey();
+        var ghost = selection.Ghost;
+
+        var ghostBuilder = new CScriptTraitsMetadata.ScriptStructTraitBuilder("SelectedGhost")
+            .WithText("GhostUid", ghost.GhostUid?.ToString() ?? string.Empty)
+            .WithText("Validate_RaceSettings", ghost.Validate_RaceSettings ?? string.Empty)
+            .WithText("Validate_ExeVersion", ghost.Validate_ExeVersion ?? string.Empty)
+            .WithText("RaceTime", ghost.RaceTime?.ToString() ?? string.Empty);
+
+        var signatureBuilder = new CScriptTraitsMetadata.ScriptStructTraitBuilder(key)
+            .WithText("Signature", SignatureText)
+            .WithText("ToolName", ToolName)
+            .WithText("Action", "EmbedRaceValidateGhost")
+            .WithText("EmbeddedAtUtc", DateTime.UtcNow.ToString("O"))
+            .WithText("MapFileName", Path.GetFileName(originalMapPath) ?? string.Empty)
+            .WithText("GhostOrReplayFileName", Path.GetFileName(originalGhostOrReplayPath) ?? string.Empty)
+            .WithText("InputType", selection.SourceKind)
+            .WithInteger("RequestedGhostIndex", selection.RequestedGhostIndex)
+            .WithInteger("UsedGhostIndex", selection.UsedGhostIndex)
+            .WithInteger("GhostCountInInput", selection.AvailableGhostCount)
+            .WithInteger("ReplacedExistingValidationGhost", replacedExistingValidationGhost ? 1 : 0)
+            .WithStruct("RaceValidateGhost", ghostBuilder);
+
+        metadata.Remove(key);
+        metadata.Declare(key, signatureBuilder.Build());
+
+        Console.WriteLine($"Embedded signature metadata under ScriptMetadata key '{key}'.");
+    }
+
+    private static string ResolveSignatureMetadataKey()
+    {
+        var env = Environment.GetEnvironmentVariable("TM_EMBED_META_KEY");
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            return env.Trim();
+        }
+
+        var legacyEnv = Environment.GetEnvironmentVariable("TM_META_KEY");
+        if (!string.IsNullOrWhiteSpace(legacyEnv))
+        {
+            return legacyEnv.Trim();
+        }
+
+        return DefaultSignatureMetadataKey;
+    }
+
+    private static void EnsureMetadataChunk(CScriptTraitsMetadata metadata)
+    {
+        if (metadata.Chunks is null)
+        {
+            return;
+        }
+
+        if (metadata.Chunks.Count == 0)
+        {
+            metadata.CreateChunk<CScriptTraitsMetadata.Chunk11002000>();
+        }
     }
 
     private static bool TryResolveGbxlzo(CliOptions options, out string gbxlzoPath, out string error)
@@ -160,7 +338,7 @@ internal static class Program
             candidates.Add(Path.Combine(mapDir, "gbxlzo.exe"));
         }
 
-        var ghostDir = Path.GetDirectoryName(Path.GetFullPath(options.GhostPath));
+        var ghostDir = Path.GetDirectoryName(Path.GetFullPath(options.GhostOrReplayPath));
         if (!string.IsNullOrWhiteSpace(ghostDir))
         {
             candidates.Add(Path.Combine(ghostDir, "gbxlzo.exe"));
@@ -243,16 +421,23 @@ internal static class Program
     private static void PrintUsage()
     {
         Console.WriteLine("Usage:");
-        Console.WriteLine(@"  dotnet run -- ""<Map.Gbx>"" ""<Ghost.Gbx>"" [Out.Map.Gbx]");
+        Console.WriteLine(@"  dotnet run -- ""<Map.Gbx>"" ""<GhostOrReplay.Gbx>"" [Out.Map.Gbx]");
         Console.WriteLine();
         Console.WriteLine("Options:");
         Console.WriteLine(@"  --out <path>       Output map path (same as optional positional Out.Map.Gbx).");
         Console.WriteLine(@"  --gbxlzo <path>    Path to gbxlzo.exe (if not in current folder/PATH).");
+        Console.WriteLine(@"  --ghost-index <n>  Ghost index for replay/clip inputs (default: 0).");
         Console.WriteLine(@"  --temp <folder>    Custom temporary working root.");
         Console.WriteLine(@"  --keep-temp        Keep temporary files for inspection.");
         Console.WriteLine();
+        Console.WriteLine("Metadata:");
+        Console.WriteLine(@"  - Writes signature metadata to ScriptMetadata key 'EmbedRaceValidationGhost'.");
+        Console.WriteLine(@"  - Set TM_EMBED_META_KEY (or TM_META_KEY) to override that key.");
+        Console.WriteLine();
         Console.WriteLine("Examples:");
         Console.WriteLine(@"  dotnet run -- ""C:\maps\track.Map.Gbx"" ""C:\maps\run.Ghost.Gbx""");
+        Console.WriteLine(@"  dotnet run -- ""C:\maps\track.Map.Gbx"" ""C:\maps\run.Replay.Gbx""");
+        Console.WriteLine(@"  dotnet run -- ""C:\maps\track.Map.Gbx"" ""C:\maps\pack.Replay.Gbx"" --ghost-index 2");
         Console.WriteLine(@"  dotnet run -- ""track.Map.Gbx"" ""run.Ghost.Gbx"" ""track_withghost.Map.Gbx""");
         Console.WriteLine(@"  dotnet run -- ""track.Map.Gbx"" ""run.Ghost.Gbx"" --gbxlzo ""C:\tools\gbxlzo.exe""");
     }
@@ -278,6 +463,13 @@ internal static class Program
             }
         }
     }
+
+    private sealed record GhostSelectionResult(
+        CGameCtnGhost Ghost,
+        string SourceKind,
+        int RequestedGhostIndex,
+        int UsedGhostIndex,
+        int AvailableGhostCount);
 
     private sealed class TemporaryWorkspace : IDisposable
     {
@@ -330,11 +522,12 @@ internal static class Program
 
     private sealed class CliOptions
     {
-        public required string GhostPath { get; init; }
+        public required string GhostOrReplayPath { get; init; }
         public required string MapPath { get; init; }
         public string? OutputPath { get; init; }
         public string? GbxlzoPath { get; init; }
         public string? TempRoot { get; init; }
+        public int GhostIndex { get; init; }
         public bool KeepTemp { get; init; }
 
         public static bool TryParse(string[] args, out CliOptions options, out string error)
@@ -343,6 +536,7 @@ internal static class Program
             string? outputPath = null;
             string? gbxlzoPath = null;
             string? tempRoot = null;
+            var ghostIndex = 0;
             var keepTemp = false;
 
             for (var i = 0; i < args.Length; i++)
@@ -362,6 +556,20 @@ internal static class Program
                         if (!TryReadValue(args, ref i, out gbxlzoPath, out error))
                         {
                             options = null!;
+                            return false;
+                        }
+                        break;
+                    case "--ghost-index":
+                        if (!TryReadValue(args, ref i, out var ghostIndexRaw, out error))
+                        {
+                            options = null!;
+                            return false;
+                        }
+
+                        if (!int.TryParse(ghostIndexRaw, out ghostIndex) || ghostIndex < 0)
+                        {
+                            options = null!;
+                            error = $"Invalid value for --ghost-index: {ghostIndexRaw}. Use a non-negative integer.";
                             return false;
                         }
                         break;
@@ -391,7 +599,7 @@ internal static class Program
             if (positional.Count < 2 || positional.Count > 3)
             {
                 options = null!;
-                error = "Expected 2 or 3 positional arguments: <Map.Gbx> <Ghost.Gbx> [Out.Map.Gbx]";
+                error = "Expected 2 or 3 positional arguments: <Map.Gbx> <GhostOrReplay.Gbx> [Out.Map.Gbx]";
                 return false;
             }
 
@@ -410,10 +618,11 @@ internal static class Program
             options = new CliOptions
             {
                 MapPath = positional[0],
-                GhostPath = positional[1],
+                GhostOrReplayPath = positional[1],
                 OutputPath = outputPath,
                 GbxlzoPath = gbxlzoPath,
                 TempRoot = tempRoot,
+                GhostIndex = ghostIndex,
                 KeepTemp = keepTemp
             };
             error = string.Empty;
